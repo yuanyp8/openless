@@ -83,14 +83,90 @@ fn read_openai_provider_config(kind: &str) -> Result<ProviderConfig, String> {
     if base_url.trim().is_empty() {
         return Err("Endpoint 为空".to_string());
     }
-    // issue #609 F-01 孪生 gap（@claude 复审 #617 指出）：ASR / provider 自定义 endpoint
-    // 同样是 attacker-controlled，且 ASR 请求也带 API Key。复用 LLM 路径已有的 SSRF 配置
-    // 校验，拒绝指向内网/回环/link-local/CGNAT/IPv6 ULA/元数据服务的地址；localhost/
-    // 127.0.0.1/::1 仍放行 http（本地 Whisper 服务）。覆盖 validate_provider_credentials
-    // (asr/llm) 连通性测试与 list_provider_models 模型列表两条 HTTP 路径。
-    crate::coordinator::validate_llm_endpoint(&base_url)
-        .map_err(|_| "endpointInvalid".to_string())?;
+
+    // 自部署 vLLM / OneAPI / Nginx NodePort 常见配置是公网 IP + HTTP。
+    // 原校验要求公网必须 HTTPS，会导致用户填 `http://36.x.x.x:30080` 时直接显示
+    // “Endpoint 格式不合法”。这里改为桌面客户端友好的校验：允许用户显式配置
+    // http/https 公网、局域网、localhost endpoint；仍拒绝云元数据、link-local、
+    // CGNAT、unspecified/broadcast 等危险地址。
+    let base_url = normalize_openai_provider_base_url(&base_url).map_err(|_| "endpointInvalid".to_string())?;
+    validate_provider_endpoint(&base_url).map_err(|_| "endpointInvalid".to_string())?;
     Ok(ProviderConfig { base_url, api_key })
+}
+
+pub(crate) fn normalize_openai_provider_base_url(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("endpointInvalid".to_string());
+    }
+    let raw = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{trimmed}")
+    };
+    let parsed = reqwest::Url::parse(&raw).map_err(|_| "endpointInvalid".to_string())?;
+    let mut url = parsed.clone();
+    let path = parsed.path().trim_end_matches('/');
+    if path.is_empty() || path == "/" {
+        url.set_path("/v1");
+    }
+    Ok(url.to_string().trim_end_matches('/').to_string())
+}
+
+pub(crate) fn validate_provider_endpoint(raw: &str) -> anyhow::Result<()> {
+    use std::net::IpAddr;
+
+    let url = reqwest::Url::parse(raw)
+        .map_err(|e| anyhow::anyhow!("provider endpoint 不是合法 URL：{e}"))?;
+    let scheme = url.scheme();
+    if scheme != "http" && scheme != "https" {
+        anyhow::bail!("provider endpoint 仅支持 http/https：{raw}");
+    }
+
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("provider endpoint 缺少主机名"))?
+        .to_ascii_lowercase();
+
+    const METADATA_HOSTS: [&str; 2] = ["metadata.google.internal", "169.254.169.254"];
+    if METADATA_HOSTS.iter().any(|m| host.contains(m)) {
+        anyhow::bail!("provider endpoint 指向云元数据服务，已拒绝：{host}");
+    }
+
+    let bare_host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host.as_str());
+    let Ok(ip) = bare_host.parse::<IpAddr>() else {
+        return Ok(());
+    };
+
+    let canonical = match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        v4 => v4,
+    };
+
+    let is_blocked = match canonical {
+        IpAddr::V4(v4) => ip_v4_is_blocked(v4),
+        IpAddr::V6(v6) => ip_v6_is_blocked(v6),
+    };
+    if is_blocked {
+        anyhow::bail!("provider endpoint 指向保留/危险地址，已拒绝（防 SSRF）：{ip}");
+    }
+
+    Ok(())
+}
+
+fn ip_v4_is_blocked(ip: std::net::Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    let is_cgnat = octets[0] == 100 && (64..=127).contains(&octets[1]);
+    ip.is_link_local() || ip.is_unspecified() || ip.is_broadcast() || is_cgnat
+}
+
+fn ip_v6_is_blocked(ip: std::net::Ipv6Addr) -> bool {
+    let segs = ip.segments();
+    let is_link_local = (segs[0] & 0xffc0) == 0xfe80;
+    ip.is_unspecified() || is_link_local
 }
 
 async fn validate_llm_provider() -> Result<(), String> {
@@ -211,8 +287,6 @@ async fn validate_bailian_asr_provider() -> Result<(), String> {
     if api_key.trim().is_empty() {
         return Err("API Key 为空".to_string());
     }
-    // 已知残留（issue #609 F-01 孪生 gap）：Bailian endpoint 走 `wss://`，与 http/https-only 的
-    // validate_llm_endpoint 不兼容，无法直接复用，需单独的 ws/wss 感知 SSRF 校验器（超本次范围）。
     let endpoint = CredentialsVault::get(CredentialAccount::AsrEndpoint)
         .map_err(|e| e.to_string())?
         .filter(|s| !s.trim().is_empty())
@@ -298,8 +372,6 @@ async fn validate_asr_transcription(config: &ProviderConfig, model: &str) -> Res
     let client = http_client_builder(&url, 20)
         .build()
         .map_err(|_| "providerClientInitFailed".to_string())?;
-    // 连接 / 请求未送出类失败做指数退避重试 —— 这类失败请求尚未送达服务端，重试
-    // 安全。超时不重试（服务端可能已在处理）。multipart 是流式 body，每次重建。
     let mut attempt: u32 = 0;
     let response = loop {
         attempt += 1;
@@ -355,8 +427,6 @@ async fn validate_asr_transcription(config: &ProviderConfig, model: &str) -> Res
 
 pub(crate) fn asr_transcriptions_url(base_url: &str) -> Result<String, String> {
     let parsed = reqwest::Url::parse(base_url.trim()).map_err(|_| "endpointInvalid".to_string())?;
-
-    // Work on the URL path only so we don't corrupt query parameters.
     let mut url = parsed.clone();
     let path = parsed.path().trim_end_matches('/');
     let next_path = if path.ends_with("/audio/transcriptions") {
@@ -411,8 +481,6 @@ pub(crate) async fn fetch_provider_models(config: &ProviderConfig) -> Result<Vec
         .map_err(|e| format!("HTTP client 初始化失败: {e}"))?;
     let mut request = client.get(&url);
     if !config.api_key.trim().is_empty() {
-        // 谷歌原生 generativelanguage.googleapis.com 不识别 Bearer Authorization,
-        // 必须用 x-goog-api-key 头。其它 OpenAI 兼容 provider 仍走 Bearer。
         if is_gemini {
             request = request.header("x-goog-api-key", config.api_key.as_str());
         } else {
@@ -475,17 +543,6 @@ pub(crate) fn parse_model_ids(body: &str) -> Result<Vec<String>, String> {
     Ok(models)
 }
 
-/// 谷歌 v1beta/models 响应形状：`{models: [{name: "models/gemini-2.5-flash",
-/// supportedGenerationMethods: ["generateContent", ...], ...}, ...]}`。
-/// 与 OpenAI `{data: [{id: "..."}]}` 不兼容，所以单独解析；name 字段去掉
-/// "models/" 前缀后即是 ProviderTools「拉取模型」按钮可直接写入 ark.model_id
-/// 的字符串。
-///
-/// 过滤：只保留声明支持 `generateContent` 的模型——Google 的 model list 同时
-/// 暴露 embedding (`gemini-embedding-2`)、TTS、image 等不支持
-/// generateContent 的家族；用户选中那种 ID 后 polish 必失败（PR #398 pr_agent
-/// 漏洞反馈）。`supportedGenerationMethods` 字段缺失时保守保留——某些 preview
-/// 模型可能未暴露这个字段，宁误显示也不要把新模型挡在外面。
 pub(crate) fn parse_gemini_model_ids(body: &str) -> Result<Vec<String>, String> {
     let json: Value =
         serde_json::from_str(body).map_err(|e| format!("模型列表不是有效 JSON: {e}"))?;
@@ -503,7 +560,7 @@ pub(crate) fn parse_gemini_model_ids(body: &str) -> Result<Vec<String>, String> 
                 Some(methods) => methods
                     .iter()
                     .any(|m| m.as_str() == Some("generateContent")),
-                None => true, // 字段缺失：保守包含
+                None => true,
             }
         })
         .filter_map(|item| item.get("name").and_then(|n| n.as_str()))
@@ -522,33 +579,41 @@ pub(crate) fn parse_gemini_model_ids(body: &str) -> Result<Vec<String>, String> 
 
 #[cfg(test)]
 mod tests {
-    // issue #609 F-01 孪生 gap（@claude 复审 #617）：ASR / provider 自定义 endpoint 也带
-    // API Key 发请求，read_openai_provider_config（连通性测试 + 模型列表 chokepoint）现在复用
-    // LLM 路径的 SSRF 校验。read_openai_provider_config 依赖凭据库无法纯单测，这里直接对它调用
-    // 的校验器锁定 ASR 形态 endpoint 的拒绝/放行契约。
-    use crate::coordinator::validate_llm_endpoint;
+    use super::{normalize_openai_provider_base_url, validate_provider_endpoint};
 
     #[test]
-    fn asr_endpoint_rejects_metadata_cgnat_and_non_https_public() {
-        // 元数据 / CGNAT / 非 https 外网：拒绝，避免带 API Key 的 ASR 请求被指向高价值目标 / 明文外泄。
-        assert!(validate_llm_endpoint("http://169.254.169.254/v1/audio/transcriptions").is_err());
-        assert!(validate_llm_endpoint("http://100.64.0.1/v1/audio/transcriptions").is_err());
-        assert!(validate_llm_endpoint("http://api.example.com/v1/audio/transcriptions").is_err());
+    fn provider_endpoint_rejects_metadata_and_cgnat() {
+        assert!(validate_provider_endpoint("http://169.254.169.254/v1/audio/transcriptions").is_err());
+        assert!(validate_provider_endpoint("http://100.64.0.1/v1/audio/transcriptions").is_err());
     }
 
     #[test]
-    fn asr_endpoint_accepts_public_https_localhost_and_lan() {
-        // 公网 https（如自建 Whisper 网关）放行。
-        validate_llm_endpoint("https://api.example.com/v1/audio/transcriptions")
-            .expect("公网 https ASR endpoint 必须通过");
-        // 本地 Whisper 服务：localhost / 127.0.0.1 http 放行。
-        validate_llm_endpoint("http://localhost:9000/v1").expect("本地 Whisper http 必须通过");
-        validate_llm_endpoint("http://127.0.0.1:9000/v1").expect("本地 Whisper http 必须通过");
-        // F-01 放宽：局域网（RFC1918）http ASR 网关放行（用户局域网自托管 Whisper）。
-        validate_llm_endpoint("http://192.168.1.50:9000/v1/audio/transcriptions")
-            .expect("局域网 http ASR endpoint 必须通过");
-        // Mimo 官方默认 endpoint（https）放行。
-        validate_llm_endpoint(crate::asr::mimo::DEFAULT_ENDPOINT)
+    fn provider_endpoint_accepts_public_http_https_localhost_and_lan() {
+        validate_provider_endpoint("http://api.example.com/v1/audio/transcriptions")
+            .expect("公网 http 自部署 endpoint 必须通过");
+        validate_provider_endpoint("https://api.example.com/v1/audio/transcriptions")
+            .expect("公网 https endpoint 必须通过");
+        validate_provider_endpoint("http://localhost:9000/v1").expect("本地 http 必须通过");
+        validate_provider_endpoint("http://127.0.0.1:9000/v1").expect("127.0.0.1 http 必须通过");
+        validate_provider_endpoint("http://192.168.1.50:9000/v1/audio/transcriptions")
+            .expect("局域网 http endpoint 必须通过");
+        validate_provider_endpoint(crate::asr::mimo::DEFAULT_ENDPOINT)
             .expect("Mimo 官方默认 endpoint 必须通过");
+    }
+
+    #[test]
+    fn provider_endpoint_normalizes_host_only_to_v1() {
+        assert_eq!(
+            normalize_openai_provider_base_url("36.147.35.14:30080").unwrap(),
+            "http://36.147.35.14:30080/v1"
+        );
+        assert_eq!(
+            normalize_openai_provider_base_url("http://36.147.35.14:30080").unwrap(),
+            "http://36.147.35.14:30080/v1"
+        );
+        assert_eq!(
+            normalize_openai_provider_base_url("http://36.147.35.14:30080/v1/chat/completions").unwrap(),
+            "http://36.147.35.14:30080/v1/chat/completions"
+        );
     }
 }
